@@ -4,91 +4,137 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-
-// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// Create HTTP server and attach Socket.io
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*", // In production, replace with your frontend URL
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  maxHttpBufferSize: 50 * 1024 * 1024, // 50MB — needed for base64 images
 });
 
-// Store connected users { socketId: username }
-const connectedUsers = {};
+const connectedUsers = {};  // socketId -> username
+const activeStreams = {};    // socketId -> { socketId, username, title }
 
-// REST endpoint to verify server is running
 app.get("/", (req, res) => {
-  res.json({ message: "Chat server is running", users: Object.values(connectedUsers) });
+  res.json({
+    message: "LiveChat server running",
+    users: Object.values(connectedUsers),
+    streams: Object.values(activeStreams),
+  });
 });
 
-// Socket.io connection handler
 io.on("connection", (socket) => {
-  console.log(`Socket connected: ${socket.id}`);
+  console.log(`Connected: ${socket.id}`);
 
-  // Event: user joins with a username
+  // ── JOIN ──────────────────────────────────────────────────────
   socket.on("user_join", (username) => {
     connectedUsers[socket.id] = username;
-    console.log(`${username} joined the chat`);
-
-    // Notify everyone that a user joined
     io.emit("user_joined", {
-      username,
+      id: Date.now(), username,
       message: `${username} joined the chat`,
       timestamp: new Date().toISOString(),
       type: "system",
       users: Object.values(connectedUsers),
+      streams: Object.values(activeStreams), // send current streams to new user
     });
   });
 
-  // Event: user sends a message
+  // ── CHAT MESSAGE (text or image) ─────────────────────────────
   socket.on("send_message", (data) => {
     const username = connectedUsers[socket.id] || "Anonymous";
-    const messagePayload = {
+    // Only emit if there is text OR an image
+    if (!data.message && !data.image) return;
+    io.emit("receive_message", {
       id: Date.now(),
       username,
-      message: data.message,
+      message: data.message || "",
+      image: data.image || null,
+      imageType: data.imageType || null,
       timestamp: new Date().toISOString(),
       type: "chat",
-    };
-
-    console.log(`Message from ${username}: ${data.message}`);
-    // Broadcast to ALL connected clients (including sender)
-    io.emit("receive_message", messagePayload);
+    });
   });
 
-  // Event: user is typing
+  // ── TYPING ───────────────────────────────────────────────────
   socket.on("typing", (isTyping) => {
     const username = connectedUsers[socket.id];
-    if (username) {
-      // Broadcast to everyone EXCEPT the sender
-      socket.broadcast.emit("user_typing", { username, isTyping });
+    if (username) socket.broadcast.emit("user_typing", { username, isTyping });
+  });
+
+  // ── STREAM START ─────────────────────────────────────────────
+  socket.on("stream_start", ({ title }) => {
+    const username = connectedUsers[socket.id];
+    if (!username) return;
+    activeStreams[socket.id] = {
+      socketId: socket.id,
+      username,
+      title: title || `${username}'s screen`,
+    };
+    io.emit("stream_started", {
+      id: Date.now(), socketId: socket.id, username,
+      title: activeStreams[socket.id].title,
+      streams: Object.values(activeStreams),
+      type: "system",
+      message: `${username} started streaming`,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  // ── STREAM STOP ──────────────────────────────────────────────
+  socket.on("stream_stop", () => {
+    const username = connectedUsers[socket.id];
+    if (activeStreams[socket.id]) {
+      delete activeStreams[socket.id];
+      io.emit("stream_stopped", {
+        id: Date.now(), socketId: socket.id, username,
+        streams: Object.values(activeStreams),
+        type: "system",
+        message: `${username} stopped streaming`,
+        timestamp: new Date().toISOString(),
+      });
     }
   });
 
-  // Event: user disconnects
+  // ── WebRTC SIGNALING ─────────────────────────────────────────
+  socket.on("webrtc_offer", ({ offer, viewerSocketId }) => {
+    io.to(viewerSocketId).emit("webrtc_offer", { offer, streamerSocketId: socket.id });
+  });
+
+  socket.on("webrtc_answer", ({ answer, streamerSocketId }) => {
+    io.to(streamerSocketId).emit("webrtc_answer", { answer, viewerSocketId: socket.id });
+  });
+
+  socket.on("ice_candidate", ({ candidate, targetSocketId }) => {
+    io.to(targetSocketId).emit("ice_candidate", { candidate, fromSocketId: socket.id });
+  });
+
+  socket.on("watch_stream", ({ streamerSocketId }) => {
+    io.to(streamerSocketId).emit("viewer_joined", { viewerSocketId: socket.id });
+  });
+
+  socket.on("stop_watching", ({ streamerSocketId }) => {
+    io.to(streamerSocketId).emit("viewer_left", { viewerSocketId: socket.id });
+  });
+
+  // ── DISCONNECT ───────────────────────────────────────────────
   socket.on("disconnect", () => {
     const username = connectedUsers[socket.id];
     if (username) {
       delete connectedUsers[socket.id];
-      console.log(`${username} disconnected`);
-
+      if (activeStreams[socket.id]) delete activeStreams[socket.id];
       io.emit("user_left", {
-        username,
+        id: Date.now(), username,
         message: `${username} left the chat`,
         timestamp: new Date().toISOString(),
         type: "system",
         users: Object.values(connectedUsers),
+        streams: Object.values(activeStreams),
       });
     }
   });
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
